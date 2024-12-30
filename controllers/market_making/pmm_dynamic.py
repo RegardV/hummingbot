@@ -82,12 +82,16 @@ class PMMDynamicControllerConfig(MarketMakingControllerConfigBase):
 
 class PMMDynamicController(MarketMakingControllerBase):
     """
-    This is a dynamic version of the PMM controller.It uses the MACD to shift the mid-price and the NATR
+    This is a dynamic version of the PMM controller. It uses the MACD to shift the mid-price and the NATR
     to make the spreads dynamic. It also uses the Triple Barrier Strategy to manage the risk.
     """
     def __init__(self, config: PMMDynamicControllerConfig, *args, **kwargs):
+        super().__init__(config, *args, **kwargs)
         self.config = config
         self.max_records = max(config.macd_slow, config.macd_fast, config.macd_signal, config.natr_length) + 100
+        self.warm_up_period = 10  # Number of updates needed before trading
+        self.warm_up_counter = 0
+        self.warm_up_complete = False
         if len(self.config.candles_config) == 0:
             self.config.candles_config = [CandlesConfig(
                 connector=config.candles_connector,
@@ -95,13 +99,37 @@ class PMMDynamicController(MarketMakingControllerBase):
                 interval=config.interval,
                 max_records=self.max_records
             )]
-        super().__init__(config, *args, **kwargs)
 
     async def update_processed_data(self):
-        candles = self.market_data_provider.get_candles_df(connector_name=self.config.candles_connector,
-                                                           trading_pair=self.config.candles_trading_pair,
-                                                           interval=self.config.interval,
-                                                           max_records=self.max_records)
+        candles = self.market_data_provider.get_candles_df(
+            connector_name=self.config.candles_connector,
+            trading_pair=self.config.candles_trading_pair,
+            interval=self.config.interval,
+            max_records=self.max_records
+        )
+        
+        if len(candles) < self.max_records:
+            # Use current market price or average of available data
+            if len(candles) > 0:
+                initial_price = candles['close'].iloc[-1]  # Last known price
+            else:
+                # If no data at all, fetch current market price
+                current_market_data = await self.market_data_provider.get_order_book(self.config.connector_name, self.config.trading_pair)
+                if current_market_data['bids'] and current_market_data['asks']:
+                    initial_price = (current_market_data['bids'][0]['price'] + current_market_data['asks'][0]['price']) / 2
+                else:
+                    # Fallback to some default value if no market data
+                    initial_price = Decimal('100')  # Example default price, adjust as needed
+                    
+            self.processed_data = {
+                "reference_price": Decimal(initial_price),
+                "spread_multiplier": Decimal('0.01'),  # Default spread multiplier
+                "features": candles
+            }
+            self.log("Using fallback price mechanism due to insufficient data.")
+            return
+
+        # If there's enough data, proceed with normal computation
         natr = ta.natr(candles["high"], candles["low"], candles["close"], length=self.config.natr_length) / 100
         macd_output = ta.macd(candles["close"], fast=self.config.macd_fast,
                               slow=self.config.macd_slow, signal=self.config.macd_signal)
@@ -118,6 +146,10 @@ class PMMDynamicController(MarketMakingControllerBase):
             "spread_multiplier": Decimal(candles["spread_multiplier"].iloc[-1]),
             "features": candles
         }
+        
+        self.warm_up_counter += 1
+        if self.warm_up_counter >= self.warm_up_period:
+            self.warm_up_complete = True
 
     def get_executor_config(self, level_id: str, price: Decimal, amount: Decimal):
         trade_type = self.get_trade_type_from_level_id(level_id)
@@ -132,3 +164,9 @@ class PMMDynamicController(MarketMakingControllerBase):
             leverage=self.config.leverage,
             side=trade_type,
         )
+
+    def should_execute_trade(self):
+        return self.warm_up_complete
+
+    def log(self, message):
+        print(f"[{self.__class__.__name__}] {message}")
